@@ -1,0 +1,1303 @@
+"""
+Head-Tracking Application for DirectX Games with PyQt6 GUI
+Dark-themed GUI, QThread integration, global hotkeys (keyboard)
+
+Gerekli Kütüphaneler:
+pip install opencv-python mediapipe numpy PyQt6 keyboard
+
+Author: Head Tracking System (extended with GUI)
+Version: 1.1
+"""
+
+import sys
+import time
+import json
+import ctypes
+from ctypes import wintypes
+from collections import deque
+from enum import Enum
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+from PyQt6.QtCore import Qt, pyqtSignal, QThread, QSize
+from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QLabel, QSlider, QComboBox,
+    QPushButton, QVBoxLayout, QHBoxLayout, QGridLayout, QMessageBox, QFileDialog
+)
+
+try:
+    import keyboard
+except Exception:
+    keyboard = None
+
+# DirectInput Hardware Scan Codes (Numpad tuşları)
+SCAN_CODES = {
+    'NUM_4': 0x4B,   # Numpad 4
+    'NUM_7': 0x47,   # Up-Left (Hafif Sol)
+    'NUM_5': 0x4C,   # Center (Merkez)
+    'NUM_9': 0x49,   # Up-Right (Hafif Sağ)
+    'NUM_6': 0x4D,   # Numpad 6
+}
+
+# Bölge tanımları
+class GameZone(Enum):
+    """Yaw açısına göre oyun bölgeleri"""
+    FAR_LEFT = ('NUM_4', -90, -40, "En Sol")      # Yaw < -40°
+    SOFT_LEFT = ('NUM_7', -40, -15, "Hafif Sol")  # -40° ≤ Yaw < -15°
+    CENTER = ('NUM_5', -15, 15, "Merkez")         # -15° ≤ Yaw ≤ 15° [DEADZONE]
+    SOFT_RIGHT = ('NUM_9', 15, 40, "Hafif Sağ")   # 15° < Yaw ≤ 40°
+    FAR_RIGHT = ('NUM_6', 40, 90, "En Sağ")       # Yaw > 40°
+
+
+class DirectInputKeyboard:
+    """
+    Windows API ve DirectInput Hardware Scan Codes kullanarak tuş kontrolü
+    ctypes aracılığıyla kernel seviyesinde çalışır
+    """
+    
+    def __init__(self):
+        """Windows API'ye erişimi başlat"""
+        self.user32 = ctypes.windll.user32
+        self.kernel32 = ctypes.windll.kernel32
+        
+        # Keyboard event flags
+        self.KEYEVENTF_SCANCODE = 0x0008
+        self.KEYEVENTF_KEYUP = 0x0002
+        self.KEYEVENTF_EXTENDEDKEY = 0x0001
+
+        # Proper Win32 INPUT structs for SendInput (ctypes)
+        self.INPUT_KEYBOARD = 1
+        self.PUL = ctypes.POINTER(ctypes.c_ulong)
+
+        class KEYBDINPUT(ctypes.Structure):
+            _fields_ = [
+                ("wVk", wintypes.WORD),
+                ("wScan", wintypes.WORD),
+                ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD),
+                ("dwExtraInfo", self.PUL),
+            ]
+
+        class INPUTUNION(ctypes.Union):
+            _fields_ = [("ki", KEYBDINPUT)]
+
+        class INPUT(ctypes.Structure):
+            _fields_ = [
+                ("type", wintypes.DWORD),
+                ("u", INPUTUNION),
+            ]
+
+        self.KEYBDINPUT = KEYBDINPUT
+        self.INPUTUNION = INPUTUNION
+        self.INPUT = INPUT
+
+        self.user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(self.INPUT), ctypes.c_int)
+        self.user32.SendInput.restype = wintypes.UINT
+        # GetLastError is in kernel32, not user32
+        self.kernel32.GetLastError.argtypes = ()
+        self.kernel32.GetLastError.restype = wintypes.DWORD
+        self.verbose_errors = False
+    
+    def send_key_event(self, scan_code, is_key_down=True):
+        """
+        DirectInput hardware scan code ile tuş gönder
+        
+        Args:
+            scan_code (int): Hardware scan code (0x4A, 0x47, vb.)
+            is_key_down (bool): True = KeyDown, False = KeyUp
+        """
+        flags = self.KEYEVENTF_SCANCODE
+        if not is_key_down:
+            flags |= self.KEYEVENTF_KEYUP
+
+        ki = self.KEYBDINPUT(
+            wVk=0,
+            wScan=int(scan_code),
+            dwFlags=flags,
+            time=0,
+            dwExtraInfo=ctypes.pointer(ctypes.c_ulong(0)),
+        )
+        inp = self.INPUT(type=self.INPUT_KEYBOARD, u=self.INPUTUNION(ki=ki))
+        arr = (self.INPUT * 1)(inp)
+
+        sent = self.user32.SendInput(1, arr, ctypes.sizeof(self.INPUT))
+        if sent == 1:
+            return
+
+        # Fallback path: try keybd_event with the same scancode if SendInput fails.
+        try:
+            self.user32.keybd_event(0, scan_code, flags, 0)
+            return
+        except Exception:
+            pass
+
+        if self.verbose_errors:
+            err = self.kernel32.GetLastError()
+            print(f"[HATA] Key send failed. scan={scan_code}, down={is_key_down}, err={err}")
+
+
+class SmoothingFilter:
+    """
+    Açı verilerini yumuşatmak için Moving Average (Hareketli Ortalama) filtresi
+    Ani sıçramaları ve tremor'u engeller
+    """
+    
+    def __init__(self, window_size=5):
+        """
+        Args:
+            window_size (int): Ortalama için kullanılacak veri noktası sayısı
+        """
+        self.window_size = window_size
+        self.buffer = deque(maxlen=window_size)
+    
+    def apply(self, value):
+        """
+        Değeri filtrele ve pürüzsüzleştirilmiş sonuç dön
+        
+        Args:
+            value (float): Ham açı değeri
+        
+        Returns:
+            float: Filtreli açı değeri
+        """
+        self.buffer.append(value)
+        if len(self.buffer) > 0:
+            return float(np.mean(self.buffer))
+        return float(value)
+
+
+class FaceHeadDetector:
+    """
+    MediaPipe Face Mesh kullanarak yüz tespiti ve Yaw açı hesaplaması
+    """
+    
+    def __init__(self):
+        try:
+            import mediapipe as mp
+            # prefer solutions.face_mesh
+            if hasattr(mp, 'solutions') and hasattr(mp.solutions, 'face_mesh'):
+                self.mp_face_mesh = mp.solutions.face_mesh
+                self.face_mesh = self.mp_face_mesh.FaceMesh(
+                    static_image_mode=False,
+                    max_num_faces=1,
+                    min_detection_confidence=0.7,
+                    min_tracking_confidence=0.7
+                )
+            else:
+                # fallback for tasks API
+                from mediapipe.tasks import python as mp_python
+                from mediapipe.tasks.python import vision
+                self.mp_face_mesh = vision
+                # tasks API usage differs; in many envs solutions exist, so keep a minimal fallback
+                self.face_mesh = None
+                print('[UYARI] MediaPipe tasks API detected; FaceMesh instance not created.')
+        except Exception as e:
+            raise ImportError('MediaPipe yüklenemedi. Lütfen: pip install mediapipe') from e
+    
+    def calculate_yaw_angle(self, landmarks, frame_width, frame_height):
+        """
+        Yaw açısını hesapla: Yüz mesh landmark'larından yatay dönüş açısı
+        
+        Landmark 1 = Burun ucu
+        Landmark 33 = Sol göz
+        Landmark 263 = Sağ göz
+        
+        Burun merkezi ile göz merkezi arası mesafe => Yaw açı
+        
+        Args:
+            landmarks: Face Mesh landmarks (468 nokta)
+            frame_width (int): Video çerçevesi genişliği
+            frame_height (int): Video çerçevesi yüksekliği
+        
+        Returns:
+            float: Yaw açı (-90 ila 90 derece, - = sol, + = sağ)
+        """
+        try:
+            # Landmark indexleri
+            NOSE_TIP = 1
+            LEFT_EYE = 33
+            RIGHT_EYE = 263
+            
+            # Normalized koordinatları pixel koordinatlarına çevir
+            nose = np.array([
+                landmarks[NOSE_TIP].x * frame_width,
+                landmarks[NOSE_TIP].y * frame_height
+            ])
+            
+            left_eye = np.array([
+                landmarks[LEFT_EYE].x * frame_width,
+                landmarks[LEFT_EYE].y * frame_height
+            ])
+            
+            right_eye = np.array([
+                landmarks[RIGHT_EYE].x * frame_width,
+                landmarks[RIGHT_EYE].y * frame_height
+            ])
+            
+            # Göz merkezi
+            eye_center = (left_eye + right_eye) / 2.0
+            
+            # Burun ile göz merkezi arasındaki yatay açı (delta X)
+            dx = nose[0] - eye_center[0]
+            
+            # Normalize et: -1 ile 1 arasına, sonra -90 ile 90 derecesine çevir
+            max_displacement = frame_width / 3.5  # Empirik değer
+            yaw_normalized = np.clip(dx / max_displacement, -1.0, 1.0)
+            yaw_angle = yaw_normalized * 90.0
+            
+            return yaw_angle
+        
+        except Exception as e:
+            print(f"[HATA] Yaw açı hesaplamada sorun: {e}")
+            return 0.0
+    
+    def detect_and_calculate(self, frame):
+        """
+        Çerçevede yüz tespit et ve Yaw açısını hesapla
+        
+        Args:
+            frame: OpenCV frame (BGR)
+        
+        Returns:
+            tuple: (yaw_angle, landmarks, face_detected)
+        """
+        frame_height, frame_width, _ = frame.shape
+        if self.face_mesh is None:
+            return 0.0, None, False
+
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self.face_mesh.process(frame_rgb)
+
+        if results.multi_face_landmarks and len(results.multi_face_landmarks) > 0:
+            landmarks = results.multi_face_landmarks[0].landmark
+            yaw = self.calculate_yaw_angle(landmarks, frame_width, frame_height)
+            return yaw, landmarks, True
+
+        return 0.0, None, False
+    
+    def close(self):
+        """MediaPipe kaynaklarını serbest bırak"""
+        if hasattr(self, 'face_mesh'):
+            try:
+                self.face_mesh.close()
+            except Exception:
+                pass
+
+
+# -----------------------------
+# QThread Worker for Tracking
+# -----------------------------
+class TrackingWorker(QThread):
+    image_signal = pyqtSignal(QImage)
+    yaw_signal = pyqtSignal(float)
+    zone_signal = pyqtSignal(str)
+    status_signal = pyqtSignal(str)
+    calibrated_signal = pyqtSignal(float)
+
+    def __init__(self, zone_thresholds=None, zone_keymap=None, smoothing_window=5, tap_duration_ms=10, parent=None):
+        super().__init__(parent=parent)
+        self.detector = FaceHeadDetector()
+        self.keyboard = DirectInputKeyboard()
+        self.smoothing = SmoothingFilter(window_size=smoothing_window)
+
+        # Video capture
+        self.cap = cv2.VideoCapture(0)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self.cap.set(cv2.CAP_PROP_FPS, 30)
+
+        # Dynamic thresholds (degrees)
+        self.zone_thresholds = zone_thresholds or {
+            'far_left': -12,
+            'soft_left': -7,
+            'center_min': -6,
+            'center_max': 6,
+            'soft_right': 12,
+            'far_right': 20,
+        }
+
+        # Key mapping: zone name -> scan code
+        default_map = {
+            'FAR_LEFT': SCAN_CODES['NUM_4'],
+            'SOFT_LEFT': SCAN_CODES['NUM_7'],
+            'CENTER': SCAN_CODES['NUM_5'],
+            'SOFT_RIGHT': SCAN_CODES['NUM_9'],
+            'FAR_RIGHT': SCAN_CODES['NUM_6'],
+        }
+        self.zone_keymap = zone_keymap or default_map
+
+        # State machine
+        self.current_zone = None
+        self.key_pressed = False
+        self.current_scan = None
+
+        # Control flags
+        self.running = True
+        self.send_keys_enabled = True
+        self.preview_enabled = True
+        self.calibration_offset = 0.0
+        self.calibration_requested = False
+        self.calibrating = False
+        self.debug_keys = False
+        self.tap_duration_ms = int(tap_duration_ms)
+
+    def run(self):
+        self.status_signal.emit('started')
+        while self.running:
+            ret, frame = self.cap.read()
+            if not ret:
+                self.status_signal.emit('camera_error')
+                break
+
+            frame = cv2.flip(frame, 1)
+            raw_yaw, landmarks, face_detected = self.detector.detect_and_calculate(frame)
+
+            # If calibration requested, perform it inside worker thread using raw yaw samples.
+            if self.calibration_requested:
+                self._perform_calibration()
+
+            if face_detected:
+                # apply calibration offset
+                yaw_adj = raw_yaw - self.calibration_offset
+                smoothed = self.smoothing.apply(yaw_adj)
+
+                zone = self.get_zone_from_angle(smoothed)
+                self.handle_zone_change(zone)
+
+                # Emit status
+                self.yaw_signal.emit(smoothed)
+                self.zone_signal.emit(zone.name)
+
+                # Emit image if preview enabled
+                if self.preview_enabled:
+                    qimg = self.cv_frame_to_qimage(frame)
+                    self.image_signal.emit(qimg)
+            else:
+                # face not found -> release keys
+                self.release_all_keys()
+                if self.preview_enabled:
+                    qimg = self.cv_frame_to_qimage(frame)
+                    self.image_signal.emit(qimg)
+
+            time.sleep(0.01)
+
+        # cleanup
+        try:
+            self.cap.release()
+        except Exception:
+            pass
+        self.detector.close()
+        self.status_signal.emit('stopped')
+
+    def stop(self):
+        self.running = False
+        # ensure keys released
+        self.release_all_keys()
+
+    def cv_frame_to_qimage(self, frame):
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb.shape
+        bytes_per_line = ch * w
+        qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+        return qimg.copy()
+
+    def get_zone_from_angle(self, yaw_angle):
+        """Zone classification with hysteresis to prevent flickering.
+        
+        Entry: Strict thresholds (normal boundaries).
+        Exit: Looser thresholds (stay in zone until crossing back past center boundary).
+        """
+        t = self.zone_thresholds
+        current = self.current_zone
+        
+        # ============ LEFT SIDE ============
+        
+        # FAR_LEFT: Enter at far_left, exit only when passing beyond soft_left
+        if current == GameZone.FAR_LEFT:
+            if yaw_angle > t['soft_left']:
+                return GameZone.SOFT_LEFT  # Exit FAR_LEFT
+            return GameZone.FAR_LEFT  # Stay FAR_LEFT
+        
+        if yaw_angle < t['far_left']:
+            return GameZone.FAR_LEFT
+        
+        # SOFT_LEFT: Enter at soft_left, exit only when passing beyond center_min
+        if current == GameZone.SOFT_LEFT:
+            if yaw_angle > t['center_min']:
+                return GameZone.CENTER  # Exit SOFT_LEFT
+            return GameZone.SOFT_LEFT  # Stay SOFT_LEFT
+        
+        if yaw_angle <= t['soft_left']:
+            return GameZone.SOFT_LEFT
+        
+        # ============ CENTER ============
+        # Center is the safe zone; stay here unless clearly entering left or right
+        
+        # Check right side first (for entering SOFT_RIGHT)
+        if current == GameZone.SOFT_RIGHT:
+            # Stay in SOFT_RIGHT until yaw drops below center_max
+            if yaw_angle <= t['center_max']:
+                return GameZone.CENTER
+            if yaw_angle < t['far_right']:
+                return GameZone.SOFT_RIGHT
+            return GameZone.FAR_RIGHT
+        
+        if current == GameZone.FAR_RIGHT:
+            # Stay in FAR_RIGHT until yaw drops below soft_right
+            if yaw_angle < t['soft_right']:
+                return GameZone.SOFT_RIGHT
+            return GameZone.FAR_RIGHT
+        
+        # If not in a right zone, check if we should enter right side
+        if yaw_angle >= t['soft_right']:
+            if yaw_angle >= t['far_right']:
+                return GameZone.FAR_RIGHT
+            return GameZone.SOFT_RIGHT
+        
+        # Default: CENTER zone (safe zone between left and right)
+        return GameZone.CENTER
+
+    def handle_zone_change(self, new_zone):
+        if new_zone != self.current_zone:
+            # tap new key once; do not hold it
+            new_scan = self.zone_keymap.get(new_zone.name, None)
+            if new_scan and self.send_keys_enabled:
+                if self.debug_keys:
+                    print(f"[TAP] {new_zone.name} scan={new_scan}")
+                self.keyboard.send_key_event(new_scan, is_key_down=True)
+                time.sleep(max(self.tap_duration_ms, 1) / 1000.0)
+                self.keyboard.send_key_event(new_scan, is_key_down=False)
+                self.current_scan = new_scan
+
+            self.current_zone = new_zone
+            self.key_pressed = False
+
+    def release_all_keys(self):
+        # Keys are not held anymore, only reset state.
+        self.key_pressed = False
+        self.current_zone = None
+
+    def set_smoothing(self, window_size):
+        # re-init smoother buffer
+        self.smoothing = SmoothingFilter(window_size=window_size)
+
+    def set_tap_duration(self, tap_duration_ms):
+        self.tap_duration_ms = max(1, int(tap_duration_ms))
+
+    def calibrate(self, current_yaw):
+        self.calibration_offset = current_yaw
+
+    def request_calibration(self):
+        self.calibration_requested = True
+
+    def _perform_calibration(self):
+        # Avoid re-entrant calibration
+        if self.calibrating:
+            return
+
+        self.calibrating = True
+        self.calibration_requested = False
+
+        samples = []
+        max_frames = 18
+        needed = 10
+
+        for _ in range(max_frames):
+            if not self.running:
+                break
+            ret, frame = self.cap.read()
+            if not ret:
+                continue
+            frame = cv2.flip(frame, 1)
+            raw_yaw, _, face_detected = self.detector.detect_and_calculate(frame)
+            if face_detected:
+                samples.append(float(raw_yaw))
+                if len(samples) >= needed:
+                    break
+            time.sleep(0.005)
+
+        if samples:
+            # robust center estimate to reduce instant noise/drift
+            self.calibration_offset = float(np.median(samples))
+            # reset smoothing buffer so old values do not pull yaw away from 0
+            self.smoothing = SmoothingFilter(window_size=self.smoothing.window_size)
+            # clear zone state so next frame can re-evaluate from the new center point
+            self.current_zone = None
+            self.current_scan = None
+            self.key_pressed = False
+            self.calibrated_signal.emit(0.0)
+        else:
+            self.calibrated_signal.emit(0.0)
+
+        self.calibrating = False
+
+    def update_threshold(self, key, value):
+        # key in one of zone_thresholds
+        self.zone_thresholds[key] = value
+
+    def update_zone_key(self, zone_name, scan_code):
+        self.zone_keymap[zone_name] = scan_code
+
+
+class HeadTrackingGameController:
+    """
+    State Machine tabanlı Head Tracking oyun kontrol sistemi
+    
+    Özellikler:
+    - Tuş spamlama önleme (State Machine)
+    - Açı yumuşatma (Smoothing)
+    - 5 bölge sistem
+    - Kernel seviyesi DirectInput tuş kontrolü
+    """
+    
+    def __init__(self):
+        """Sistemi başlat"""
+        self.detector = FaceHeadDetector()
+        self.keyboard = DirectInputKeyboard()
+        self.smoother = SmoothingFilter(window_size=5)
+        
+        # State tracking
+        self.current_zone = None
+        self.previous_zone = None
+        self.key_currently_pressed = False
+        self.current_scan_code = None
+        
+        # Video capture
+        self.cap = cv2.VideoCapture(0)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self.cap.set(cv2.CAP_PROP_FPS, 30)
+        
+        # Uygulamayı eksekuter kontrol flag'ı
+        self.app_running = True
+        
+        # İstatistikler
+        self.frame_count = 0
+        self.fps = 0.0
+        self.last_time = time.time()
+    
+    def get_zone_from_angle(self, yaw_angle):
+        """
+        Yaw açısına göre bölgeyi belirle
+        
+        Args:
+            yaw_angle (float): Derece cinsinden Yaw açı
+        
+        Returns:
+            GameZone: Belirlenen bölge
+        """
+        for zone in GameZone:
+            key_name, min_angle, max_angle, display_name = zone.value
+            if min_angle <= yaw_angle <= max_angle:
+                return zone
+        
+        # Fallback (abnormal case)
+        return GameZone.CENTER
+    
+    def handle_zone_change(self, new_zone):
+        """
+        State Machine: Bölge değişimi handle et ve tuşları kontrol et
+        
+        Mantık:
+        1. Yeni bölgeye girildiğinde: KeyDown gönder
+        2. Bölgede kalındığında: Tuş basılı tut (tekrar gönderme)
+        3. Bölgeden çıkıldığında: KeyUp gönder
+        
+        Args:
+            new_zone (GameZone): Yeni bölge
+        """
+        # Bölge değişti mi?
+        if new_zone != self.current_zone:
+            # Önceki tuşu release et
+            if self.current_zone is not None and self.key_currently_pressed:
+                old_scan_code = SCAN_CODES[self.current_zone.value[0]]
+                self.keyboard.send_key_event(old_scan_code, is_key_down=False)
+                self.key_currently_pressed = False
+            
+            # Yeni tuş basılı tut
+            new_scan_code = SCAN_CODES[new_zone.value[0]]
+            self.keyboard.send_key_event(new_scan_code, is_key_down=True)
+            self.key_currently_pressed = True
+            
+            self.current_zone = new_zone
+            self.current_scan_code = new_scan_code
+    
+    def release_all_keys(self):
+        """Tuş sıkışması olması durumunda tüm tuşları serbest bırak"""
+        if self.key_currently_pressed and self.current_zone is not None:
+            self.keyboard.send_key_event(self.current_scan_code, is_key_down=False)
+            self.key_currently_pressed = False
+            self.current_zone = None
+    
+    def process_frame(self, frame):
+        """
+        Çerçeveyi işle: Yüz detect => Yaw hesapla => Yumuşat => State update
+        
+        Args:
+            frame: OpenCV frame
+        
+        Returns:
+            tuple: (processed_frame, yaw_angle)
+        """
+        # Yüz algılama
+        raw_yaw, landmarks, face_detected = self.detector.detect_and_calculate(frame)
+        
+        if face_detected:
+            # Açı yumuşatma
+            smoothed_yaw = self.smoother.apply(raw_yaw)
+            
+            # Bölge belirle ve tuş state'ini güncelle
+            new_zone = self.get_zone_from_angle(smoothed_yaw)
+            self.handle_zone_change(new_zone)
+            
+            # Görselleştirme: Landmark'ları çiz
+            frame_height, frame_width, _ = frame.shape
+            for i, landmark in enumerate(landmarks):
+                if i % 15 == 0:  # Her 15. landmark'ı çiz (performans)
+                    x = int(landmark.x * frame_width)
+                    y = int(landmark.y * frame_height)
+                    cv2.circle(frame, (x, y), 2, (0, 255, 0), -1)
+            
+            # Bilgi panel
+            zone_name = self.current_zone.value[3] if self.current_zone else "YOK"
+            key_name = self.current_zone.value[0] if self.current_zone else "---"
+            
+            cv2.putText(frame, f"Bolge: {zone_name}", (10, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            cv2.putText(frame, f"Tus: {key_name}", (10, 70),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            cv2.putText(frame, f"Yaw: {smoothed_yaw:.1f}°", (10, 110),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            cv2.putText(frame, f"FPS: {self.fps:.1f}", (10, 150),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            
+            return frame, smoothed_yaw
+        
+        else:
+            # Yüz algılanamadı => tuşları serbest bırak
+            self.release_all_keys()
+            
+            cv2.putText(frame, "YUZ ALGILANAMADI", (150, 240),
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 2)
+            
+            return frame, None
+    
+    def update_fps(self):
+        """FPS'i hesapla"""
+        self.frame_count += 1
+        current_time = time.time()
+        elapsed = current_time - self.last_time
+        
+        if elapsed >= 1.0:
+            self.fps = self.frame_count / elapsed
+            self.frame_count = 0
+            self.last_time = current_time
+    
+    def print_config(self):
+        """Bölge konfigürasyonunu konsola yazdır"""
+        print("\n" + "="*70)
+        print("  HEAD TRACKING OYUN KONTROLÜ - BAŞLATILDI")
+        print("="*70)
+        print("\n[BÖLGE KONFIGÜRASYONU]")
+        for zone in GameZone:
+            key, min_a, max_a, display = zone.value
+            print(f"  {key:6} : {display:15} ({min_a:+3.0f}° ~ {max_a:+3.0f}°)")
+        
+        print("\n[KONTROL]")
+        print("  'q' tuşu  : Uygulamayı kapat")
+        print("  Space     : Kaynakları serbest bırak (acil durum)")
+        
+        print("\n[SİSTEM BİLGİSİ]")
+        print("  Tuş Kontrolü : ctypes + DirectInput Hardware Scan Codes")
+        print("  Yüz Algılama : MediaPipe Face Mesh")
+        print("  Filtre       : Moving Average (5 noktası)")
+        print("  State Machine: Tuş spamlama önleme [AKTIF]")
+        print("\n" + "="*70 + "\n")
+    
+    def run(self):
+        """Ana uygulama döngüsü"""
+        self.print_config()
+        
+        try:
+            while self.app_running:
+                ret, frame = self.cap.read()
+                if not ret:
+                    print("[HATA] Kamera çerçevesi alınamadı")
+                    break
+                
+                # Ayna görünümü (selfie modu)
+                frame = cv2.flip(frame, 1)
+                
+                # Çerçeveyi işle
+                processed_frame, yaw = self.process_frame(frame)
+                
+                # FPS'i güncelle
+                self.update_fps()
+                
+                # Ekranda göster
+                cv2.imshow("Head Tracking", processed_frame)
+                
+                # Tuş kontrolü
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    print("[INFO] Çıkış komutu alındı")
+                    self.app_running = False
+                elif key == ord(' '):
+                    print("[INFO] Acil durum: Tüm tuşlar serbest bırakılıyor")
+                    self.release_all_keys()
+                
+                # CPU'yu aşırı yüklememiş
+                time.sleep(0.001)
+        
+        except KeyboardInterrupt:
+            print("\n[INFO] Ctrl+C ile durduruldu")
+        
+        except Exception as e:
+            print(f"\n[HATA] Beklenmeyen hata: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        finally:
+            self.cleanup()
+    
+    def cleanup(self):
+        """Kaynakları temizle ve serbest bırak"""
+        print("\n[CLEANUP] Sistem kapatılıyor...")
+        
+        # Tuş sıkışmasını önle
+        self.release_all_keys()
+        
+        # Kaynakları serbest bırak
+        self.app_running = False
+        self.cap.release()
+        cv2.destroyAllWindows()
+        self.detector.close()
+        
+        print("[OK] Head Tracking uygulaması kapatıldı. Hoşça kalın!")
+
+
+def main():
+    """
+    Ana entry point
+    """
+    # Legacy entry kept for compatibility. Prefer running GUI below.
+    print("Legacy main invoked. Use GUI by running the script directly (if __name__ block).")
+
+
+class MainWindow(QMainWindow):
+    hotkey_signal = pyqtSignal(str)
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle('Head Tracking - GUI')
+        self.setMinimumSize(QSize(1000, 640))
+
+        # Config file path (default to Desktop/head_tracking_config.json)
+        self.config_file = Path.home() / 'Desktop' / 'head_tracking_config.json'
+
+        # Central widget
+        central = QWidget()
+        self.setCentralWidget(central)
+
+        # Video display
+        self.video_label = QLabel()
+        self.video_label.setFixedSize(640, 480)
+        self.video_label.setStyleSheet('background-color: #111111; border: 1px solid #333;')
+
+        # Controls
+        controls_layout = QGridLayout()
+
+        # Threshold sliders
+        self.sl_far_left = QSlider(Qt.Orientation.Horizontal)
+        self.sl_far_left.setRange(-89, -1)
+        self.sl_far_left.setValue(-12)
+        self.lbl_far_left_val = QLabel(str(self.sl_far_left.value()) + '°')
+        controls_layout.addWidget(QLabel('Far Left (<)'), 0, 0)
+        controls_layout.addWidget(self.sl_far_left, 0, 1)
+        controls_layout.addWidget(self.lbl_far_left_val, 0, 2)
+
+        self.sl_soft_left = QSlider(Qt.Orientation.Horizontal)
+        self.sl_soft_left.setRange(-89, -1)
+        self.sl_soft_left.setValue(-7)
+        self.lbl_soft_left_val = QLabel(str(self.sl_soft_left.value()) + '°')
+        controls_layout.addWidget(QLabel('Soft Left (<)'), 1, 0)
+        controls_layout.addWidget(self.sl_soft_left, 1, 1)
+        controls_layout.addWidget(self.lbl_soft_left_val, 1, 2)
+
+        self.sl_center_min = QSlider(Qt.Orientation.Horizontal)
+        self.sl_center_min.setRange(-30, 0)
+        self.sl_center_min.setValue(-6)
+        self.lbl_center_min_val = QLabel(str(self.sl_center_min.value()) + '°')
+        controls_layout.addWidget(QLabel('Center Min'), 2, 0)
+        controls_layout.addWidget(self.sl_center_min, 2, 1)
+        controls_layout.addWidget(self.lbl_center_min_val, 2, 2)
+
+        self.sl_center_max = QSlider(Qt.Orientation.Horizontal)
+        self.sl_center_max.setRange(0, 30)
+        self.sl_center_max.setValue(6)
+        self.lbl_center_max_val = QLabel(str(self.sl_center_max.value()) + '°')
+        controls_layout.addWidget(QLabel('Center Max'), 3, 0)
+        controls_layout.addWidget(self.sl_center_max, 3, 1)
+        controls_layout.addWidget(self.lbl_center_max_val, 3, 2)
+
+        self.sl_soft_right = QSlider(Qt.Orientation.Horizontal)
+        self.sl_soft_right.setRange(1, 89)
+        self.sl_soft_right.setValue(12)
+        self.lbl_soft_right_val = QLabel(str(self.sl_soft_right.value()) + '°')
+        controls_layout.addWidget(QLabel('Soft Right (<)'), 4, 0)
+        controls_layout.addWidget(self.sl_soft_right, 4, 1)
+        controls_layout.addWidget(self.lbl_soft_right_val, 4, 2)
+
+        # Far Right slider (visible to user)
+        self.sl_far_right = QSlider(Qt.Orientation.Horizontal)
+        self.sl_far_right.setRange(2, 89)
+        self.sl_far_right.setValue(20)
+        self.lbl_far_right_val = QLabel(str(self.sl_far_right.value()) + '°')
+        controls_layout.addWidget(QLabel('Far Right (>=)'), 5, 0)
+        controls_layout.addWidget(self.sl_far_right, 5, 1)
+        controls_layout.addWidget(self.lbl_far_right_val, 5, 2)
+
+        # move smoothing row down
+        row_offset = 1
+
+        # Smoothing
+        controls_layout.addWidget(QLabel('Smoothing (1-10)'), 6, 0)
+        self.sl_smoothing = QSlider(Qt.Orientation.Horizontal)
+        self.sl_smoothing.setRange(1, 10)
+        self.sl_smoothing.setValue(5)
+        self.lbl_smoothing_val = QLabel(str(self.sl_smoothing.value()))
+        controls_layout.addWidget(self.sl_smoothing, 6, 1)
+        controls_layout.addWidget(self.lbl_smoothing_val, 6, 2)
+
+        controls_layout.addWidget(QLabel('Tap Duration (ms)'), 7, 0)
+        self.sl_tap_duration = QSlider(Qt.Orientation.Horizontal)
+        self.sl_tap_duration.setRange(1, 50)
+        self.sl_tap_duration.setValue(10)
+        self.lbl_tap_duration_val = QLabel(str(self.sl_tap_duration.value()) + ' ms')
+        controls_layout.addWidget(self.sl_tap_duration, 7, 1)
+        controls_layout.addWidget(self.lbl_tap_duration_val, 7, 2)
+
+        # Key mapping comboboxes
+        key_options = ['Numpad 4', 'Numpad 7', 'Numpad 5', 'Numpad 9', 'Numpad 6']
+        self.cb_far_left = QComboBox()
+        self.cb_far_left.addItems(key_options)
+        self.cb_far_left.setCurrentIndex(0)
+        controls_layout.addWidget(QLabel('Far Left Key'), 8, 0)
+        controls_layout.addWidget(self.cb_far_left, 8, 1)
+
+        self.cb_soft_left = QComboBox()
+        self.cb_soft_left.addItems(key_options)
+        self.cb_soft_left.setCurrentIndex(1)
+        controls_layout.addWidget(QLabel('Soft Left Key'), 9, 0)
+        controls_layout.addWidget(self.cb_soft_left, 9, 1)
+
+        self.cb_center = QComboBox()
+        self.cb_center.addItems(key_options)
+        self.cb_center.setCurrentIndex(2)
+        controls_layout.addWidget(QLabel('Center Key'), 10, 0)
+        controls_layout.addWidget(self.cb_center, 10, 1)
+
+        self.cb_soft_right = QComboBox()
+        self.cb_soft_right.addItems(key_options)
+        self.cb_soft_right.setCurrentIndex(3)
+        controls_layout.addWidget(QLabel('Soft Right Key'), 11, 0)
+        controls_layout.addWidget(self.cb_soft_right, 11, 1)
+
+        self.cb_far_right = QComboBox()
+        self.cb_far_right.addItems(key_options)
+        self.cb_far_right.setCurrentIndex(4)
+        controls_layout.addWidget(QLabel('Far Right Key'), 12, 0)
+        controls_layout.addWidget(self.cb_far_right, 12, 1)
+
+        # Action buttons
+        self.btn_start = QPushButton('Start')
+        self.btn_stop = QPushButton('Stop')
+        self.btn_preview = QPushButton('Toggle Preview')
+        self.btn_save_config = QPushButton('Save Config')
+        self.btn_load_config = QPushButton('Load Config')
+        controls_layout.addWidget(self.btn_start, 13, 0)
+        controls_layout.addWidget(self.btn_stop, 13, 1)
+        controls_layout.addWidget(self.btn_preview, 14, 0, 1, 2)
+        controls_layout.addWidget(self.btn_save_config, 15, 0)
+        controls_layout.addWidget(self.btn_load_config, 15, 1)
+
+        # Status labels
+        self.status_label = QLabel('Status: Idle')
+        self.label_yaw = QLabel('Yaw: 0.0°')
+        self.label_zone = QLabel('Zone: N/A')
+        self.label_preview = QLabel('Preview: Off')
+        self.label_sendkeys = QLabel('SendKeys: On')
+
+        # Right layout wrapper
+        right_layout = QVBoxLayout()
+        right_layout.addLayout(controls_layout)
+        right_layout.addWidget(self.status_label)
+        # concise status panel
+        right_layout.addWidget(self.label_yaw)
+        right_layout.addWidget(self.label_zone)
+        right_layout.addWidget(self.label_preview)
+        right_layout.addWidget(self.label_sendkeys)
+        right_widget = QWidget()
+        right_widget.setLayout(right_layout)
+
+        # Main layout
+        main_layout = QHBoxLayout()
+        main_layout.addWidget(self.video_label)
+        main_layout.addWidget(right_widget)
+        central.setLayout(main_layout)
+
+        # Dark stylesheet
+        self.setStyleSheet('''
+            QMainWindow { background: #0f0f0f; }
+            QLabel { color: #e6e6e6; }
+            QPushButton { background: #222; color: #eee; padding: 6px; }
+            QSlider::groove:horizontal { height: 6px; background: #333; }
+            QSlider::handle:horizontal { background: #888; width: 12px; }
+            QComboBox { background: #1a1a1a; color: #eee; }
+        ''')
+
+        # Worker
+        self.worker = None
+        self.last_yaw = 0.0
+
+        # Connect signals
+        self.btn_start.clicked.connect(self.start_worker)
+        self.btn_stop.clicked.connect(self.stop_worker)
+        self.btn_preview.clicked.connect(self.toggle_preview)
+        self.btn_save_config.clicked.connect(self.save_config)
+        self.btn_load_config.clicked.connect(self.load_config)
+
+        self.sl_smoothing.valueChanged.connect(self.on_smoothing_changed)
+        self.sl_tap_duration.valueChanged.connect(self.on_tap_duration_changed)
+        self.sl_far_left.valueChanged.connect(self.on_threshold_changed)
+        self.sl_soft_left.valueChanged.connect(self.on_threshold_changed)
+        self.sl_center_min.valueChanged.connect(self.on_threshold_changed)
+        self.sl_center_max.valueChanged.connect(self.on_threshold_changed)
+        self.sl_soft_right.valueChanged.connect(self.on_threshold_changed)
+        self.sl_far_right.valueChanged.connect(self.on_threshold_changed)
+
+        # update value labels
+        self.sl_far_left.valueChanged.connect(lambda v: self.lbl_far_left_val.setText(f"{v}°"))
+        self.sl_soft_left.valueChanged.connect(lambda v: self.lbl_soft_left_val.setText(f"{v}°"))
+        self.sl_center_min.valueChanged.connect(lambda v: self.lbl_center_min_val.setText(f"{v}°"))
+        self.sl_center_max.valueChanged.connect(lambda v: self.lbl_center_max_val.setText(f"{v}°"))
+        self.sl_soft_right.valueChanged.connect(lambda v: self.lbl_soft_right_val.setText(f"{v}°"))
+        self.sl_far_right.valueChanged.connect(lambda v: self.lbl_far_right_val.setText(f"{v}°"))
+        self.sl_smoothing.valueChanged.connect(lambda v: self.lbl_smoothing_val.setText(str(v)))
+        self.sl_tap_duration.valueChanged.connect(lambda v: self.lbl_tap_duration_val.setText(f"{v} ms"))
+
+        # ComboBoxes change
+        self.cb_far_left.currentTextChanged.connect(self.on_keymap_changed)
+        self.cb_soft_left.currentTextChanged.connect(self.on_keymap_changed)
+        self.cb_center.currentTextChanged.connect(self.on_keymap_changed)
+        self.cb_soft_right.currentTextChanged.connect(self.on_keymap_changed)
+        self.cb_far_right.currentTextChanged.connect(self.on_keymap_changed)
+
+        # Hotkeys (use signal emit to ensure main-thread handling)
+        self.hotkey_signal.connect(self.hotkey_invoke)
+        if keyboard is not None:
+            # keyboard callbacks run in background thread; emitting a Qt signal ensures main-thread slot execution
+            keyboard.add_hotkey('f1', lambda: self.hotkey_signal.emit('F1'))
+            keyboard.add_hotkey('f2', lambda: self.hotkey_signal.emit('F2'))
+            keyboard.add_hotkey('f3', lambda: self.hotkey_signal.emit('F3'))
+            keyboard.add_hotkey('delete', lambda: self.hotkey_signal.emit('DELETE'))
+        else:
+            print('[UYARI] keyboard modülü yüklü değil. Global hotkeys devre dışı.')
+
+    def start_worker(self):
+        if self.worker and self.worker.isRunning():
+            return
+        try:
+            thresholds = {
+                'far_left': self.sl_far_left.value(),
+                'soft_left': self.sl_soft_left.value(),
+                'center_min': self.sl_center_min.value(),
+                'center_max': self.sl_center_max.value(),
+                'soft_right': self.sl_soft_right.value(),
+                'far_right': self.sl_far_right.value(),
+            }
+            # zone key map
+            zone_keymap = {
+                'FAR_LEFT': self.combo_to_scan(self.cb_far_left.currentText()),
+                'SOFT_LEFT': self.combo_to_scan(self.cb_soft_left.currentText()),
+                'CENTER': self.combo_to_scan(self.cb_center.currentText()),
+                'SOFT_RIGHT': self.combo_to_scan(self.cb_soft_right.currentText()),
+                'FAR_RIGHT': self.combo_to_scan(self.cb_far_right.currentText()),
+            }
+
+            self.worker = TrackingWorker(zone_thresholds=thresholds, zone_keymap=zone_keymap,
+                             smoothing_window=self.sl_smoothing.value(),
+                             tap_duration_ms=self.sl_tap_duration.value())
+            self.worker.image_signal.connect(self.update_image)
+            self.worker.yaw_signal.connect(self.on_yaw)
+            self.worker.zone_signal.connect(self.on_zone)
+            self.worker.status_signal.connect(self.on_status)
+            self.worker.calibrated_signal.connect(self.on_calibrated)
+            # ensure UI remains responsive: do not block on wait(); connect finished
+            self.worker.finished.connect(self.on_worker_finished)
+            self.worker.start()
+            self.status_label.setText('Status: Running')
+            self.btn_start.setEnabled(False)
+            self.btn_stop.setEnabled(True)
+        except Exception as exc:
+            self.status_label.setText('Status: Start failed')
+            QMessageBox.critical(self, 'Start Error', str(exc))
+
+    def stop_worker(self):
+        if self.worker:
+            self.worker.stop()
+            # don't block GUI thread; cleanup handled in on_worker_finished
+            self.status_label.setText('Status: Stopping...')
+            self.btn_start.setEnabled(True)
+            self.btn_stop.setEnabled(False)
+
+    def toggle_preview(self):
+        if self.worker:
+            self.worker.preview_enabled = not self.worker.preview_enabled
+            state = 'On' if self.worker.preview_enabled else 'Off'
+            self.label_preview.setText(f'Preview: {state}')
+            # if disabled, show black screen instead of frozen last frame
+            if not self.worker.preview_enabled:
+                w = self.video_label.width()
+                h = self.video_label.height()
+                black = QPixmap(w, h)
+                black.fill(Qt.GlobalColor.black)
+                self.video_label.setPixmap(black)
+            self.status_label.setText(f'Preview toggled: {state}')
+
+    def on_smoothing_changed(self, val):
+        if self.worker:
+            self.worker.set_smoothing(val)
+
+    def on_tap_duration_changed(self, val):
+        if self.worker:
+            self.worker.set_tap_duration(val)
+
+    def on_threshold_changed(self, _=None):
+        # enforce ordering: far_left <= soft_left <= center_min <= center_max <= soft_right
+        fl = self.sl_far_left.value()
+        sl = max(self.sl_soft_left.value(), fl+1)
+        self.sl_soft_left.blockSignals(True)
+        self.sl_soft_left.setValue(sl)
+        self.sl_soft_left.blockSignals(False)
+
+        cmn = min(max(self.sl_center_min.value(), sl+1), self.sl_center_max.value()-1)
+        self.sl_center_min.blockSignals(True)
+        self.sl_center_min.setValue(cmn)
+        self.sl_center_min.blockSignals(False)
+
+        cmx = max(self.sl_center_max.value(), cmn+1)
+        self.sl_center_max.blockSignals(True)
+        self.sl_center_max.setValue(cmx)
+        self.sl_center_max.blockSignals(False)
+
+        sr = max(self.sl_soft_right.value(), cmx+1)
+        self.sl_soft_right.blockSignals(True)
+        self.sl_soft_right.setValue(sr)
+        self.sl_soft_right.blockSignals(False)
+
+        fr = max(self.sl_far_right.value(), sr+1)
+        self.sl_far_right.blockSignals(True)
+        self.sl_far_right.setValue(fr)
+        self.sl_far_right.blockSignals(False)
+
+        # Push to worker
+        if self.worker:
+            self.worker.update_threshold('far_left', fl)
+            self.worker.update_threshold('soft_left', sl)
+            self.worker.update_threshold('center_min', cmn)
+            self.worker.update_threshold('center_max', cmx)
+            self.worker.update_threshold('soft_right', sr)
+            self.worker.update_threshold('far_right', fr)
+
+    def on_keymap_changed(self, _=None):
+        if not self.worker:
+            return
+        self.worker.update_zone_key('FAR_LEFT', self.combo_to_scan(self.cb_far_left.currentText()))
+        self.worker.update_zone_key('SOFT_LEFT', self.combo_to_scan(self.cb_soft_left.currentText()))
+        self.worker.update_zone_key('CENTER', self.combo_to_scan(self.cb_center.currentText()))
+        self.worker.update_zone_key('SOFT_RIGHT', self.combo_to_scan(self.cb_soft_right.currentText()))
+        self.worker.update_zone_key('FAR_RIGHT', self.combo_to_scan(self.cb_far_right.currentText()))
+
+    def combo_to_scan(self, text):
+        mapping = {
+            'Numpad 4': SCAN_CODES['NUM_4'],
+            'Numpad 7': SCAN_CODES['NUM_7'],
+            'Numpad 5': SCAN_CODES['NUM_5'],
+            'Numpad 9': SCAN_CODES['NUM_9'],
+            'Numpad 6': SCAN_CODES['NUM_6'],
+        }
+        return mapping.get(text, None)
+
+    def update_image(self, qimg: QImage):
+        pix = QPixmap.fromImage(qimg).scaled(self.video_label.size(), Qt.AspectRatioMode.KeepAspectRatio)
+        self.video_label.setPixmap(pix)
+        # When an image is shown, ensure preview label shows On
+        self.label_preview.setText('Preview: On')
+
+    def on_yaw(self, yaw):
+        # keep live yaw visible; avoid overwriting explicit calibration messages too aggressively
+        if self.worker and self.worker.calibrating:
+            return
+        self.status_label.setText(f'Yaw: {yaw:.1f}°')
+        # store last yaw for calibration
+        try:
+            self.last_yaw = float(yaw)
+        except Exception:
+            pass
+        # dedicated yaw label
+        try:
+            self.label_yaw.setText(f'Yaw: {float(yaw):.1f}°')
+        except Exception:
+            pass
+
+    def on_zone(self, zone_name):
+        self.status_label.setText(f'Zone: {zone_name}')
+        self.label_zone.setText(f'Zone: {zone_name}')
+
+    def on_status(self, s):
+        if s == 'camera_error':
+            QMessageBox.critical(self, 'Camera Error', 'Camera frame could not be read.')
+        if s == 'stopped':
+            self.status_label.setText('Status: Worker stopped')
+
+    def on_calibrated(self, _yaw_zero):
+        self.last_yaw = 0.0
+        self.label_yaw.setText('Yaw: 0.0°')
+        self.label_zone.setText('Zone: CENTER')
+        self.label_sendkeys.setText(f'SendKeys: {"On" if self.worker and self.worker.send_keys_enabled else "Off"}')
+        self.status_label.setText('Calibrated')
+
+    def on_worker_finished(self):
+        # Called when worker thread fully exits
+        self.status_label.setText('Status: Stopped')
+        self.worker = None
+        self.btn_start.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+
+    def hotkey_invoke(self, keyname):
+        # Map actions
+        if keyname == 'F1':
+            # calibrate: set current yaw as center
+            if self.worker:
+                try:
+                    self.label_yaw.setText('Yaw: 0.0°')
+                    self.status_label.setText('Calibrating... keep head still for a moment')
+                    self.worker.request_calibration()
+                except Exception:
+                    self.status_label.setText('Calibrate failed')
+        elif keyname == 'F2':
+            if self.worker:
+                self.worker.send_keys_enabled = not self.worker.send_keys_enabled
+                state = 'On' if self.worker.send_keys_enabled else 'Off'
+                self.label_sendkeys.setText(f'SendKeys: {state}')
+                self.status_label.setText(f'SendKeys toggled: {state}')
+        elif keyname == 'F3':
+            if self.worker:
+                self.worker.preview_enabled = not self.worker.preview_enabled
+                self.status_label.setText(f'Preview: {self.worker.preview_enabled}')
+        elif keyname == 'DELETE':
+            # stop and close
+            self.stop_worker()
+            QApplication.quit()
+
+    def closeEvent(self, event):
+        # cleanup keyboard hooks
+        if keyboard is not None:
+            try:
+                keyboard.unhook_all()
+            except Exception:
+                pass
+        self.stop_worker()
+        event.accept()
+
+    def save_config(self):
+        """Save current configuration to JSON file"""
+        config = {
+            "thresholds": {
+                "far_left": self.sl_far_left.value(),
+                "soft_left": self.sl_soft_left.value(),
+                "center_min": self.sl_center_min.value(),
+                "center_max": self.sl_center_max.value(),
+                "soft_right": self.sl_soft_right.value(),
+                "far_right": self.sl_far_right.value(),
+            },
+            "keys": {
+                "FAR_LEFT": self.cb_far_left.currentText(),
+                "SOFT_LEFT": self.cb_soft_left.currentText(),
+                "CENTER": self.cb_center.currentText(),
+                "SOFT_RIGHT": self.cb_soft_right.currentText(),
+                "FAR_RIGHT": self.cb_far_right.currentText(),
+            },
+            "smoothing": self.sl_smoothing.value(),
+            "tap_duration": self.sl_tap_duration.value(),
+        }
+        
+        try:
+            with open(self.config_file, 'w') as f:
+                json.dump(config, f, indent=2)
+            self.status_label.setText(f'Config saved: {self.config_file.name}')
+            QMessageBox.information(self, 'Success', f'Config saved to:\n{self.config_file}')
+        except Exception as e:
+            self.status_label.setText('Config save failed')
+            QMessageBox.critical(self, 'Save Error', f'Could not save config:\n{str(e)}')
+
+    def load_config(self):
+        """Load configuration from JSON file"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            'Load Config',
+            str(Path.home() / 'Desktop'),
+            'JSON Files (*.json);;All Files (*)'
+        )
+        
+        if not file_path:
+            return
+        
+        try:
+            self.config_file = Path(file_path)
+            with open(self.config_file, 'r') as f:
+                config = json.load(f)
+            
+            # Load thresholds
+            t = config.get('thresholds', {})
+            self.sl_far_left.setValue(t.get('far_left', -12))
+            self.sl_soft_left.setValue(t.get('soft_left', -7))
+            self.sl_center_min.setValue(t.get('center_min', -6))
+            self.sl_center_max.setValue(t.get('center_max', 6))
+            self.sl_soft_right.setValue(t.get('soft_right', 12))
+            self.sl_far_right.setValue(t.get('far_right', 20))
+            
+            # Load keys
+            keys = config.get('keys', {})
+            self._set_combo_by_text(self.cb_far_left, keys.get('FAR_LEFT', 'Numpad 4'))
+            self._set_combo_by_text(self.cb_soft_left, keys.get('SOFT_LEFT', 'Numpad 7'))
+            self._set_combo_by_text(self.cb_center, keys.get('CENTER', 'Numpad 5'))
+            self._set_combo_by_text(self.cb_soft_right, keys.get('SOFT_RIGHT', 'Numpad 9'))
+            self._set_combo_by_text(self.cb_far_right, keys.get('FAR_RIGHT', 'Numpad 6'))
+            
+            # Load others
+            self.sl_smoothing.setValue(config.get('smoothing', 5))
+            self.sl_tap_duration.setValue(config.get('tap_duration', 10))
+            
+            self.status_label.setText(f'Config loaded: {self.config_file.name}')
+            QMessageBox.information(self, 'Success', f'Config loaded from:\n{self.config_file}')
+        except Exception as e:
+            self.status_label.setText('Config load failed')
+            QMessageBox.critical(self, 'Load Error', f'Could not load config:\n{str(e)}')
+
+    def _set_combo_by_text(self, combo, text):
+        """Helper to set combobox value by text"""
+        idx = combo.findText(text, Qt.MatchFlag.MatchExactly)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+
+
+if __name__ == '__main__':
+    # Start GUI app
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
