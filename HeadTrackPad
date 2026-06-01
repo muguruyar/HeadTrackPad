@@ -1,13 +1,3 @@
-"""
-Head-Tracking Application for DirectX Games with PyQt6 GUI
-Dark-themed GUI, QThread integration, global hotkeys (keyboard)
-
-Gerekli Kütüphaneler:
-pip install opencv-python mediapipe numpy PyQt6 keyboard
-
-Author: Head Tracking System (extended with GUI)
-Version: 1.1
-"""
 
 import sys
 import time
